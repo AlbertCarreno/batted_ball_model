@@ -1,0 +1,177 @@
+---
+title: "final_hitprob_model"
+author: "Albert"
+date: "2025-04-02"
+output: html_document
+---
+
+```{r }
+# I first loaded in and cleaned the data, removing superfluous variables
+library(tidyverse)
+library(caret)
+load("final_hitprob.RData")
+outcomes <- c("Double", "HomeRun", "Out", "Single")
+hit_data <- read.csv("BaseballData.csv", stringsAsFactors = TRUE)
+hit_data <- hit_data %>% 
+  filter(!PlayResult %in% c("Undefined", "CaughtStealing", "StolenBase",
+                            "Undefined ", "Triple"))
+hit_data$PlayResult <- as.character(hit_data$PlayResult)
+hit_data$PlayResult[hit_data$PlayResult %in% c("Sacrifice", "FieldersChoice",
+                                               "Error")] <- "Out"
+hit_data$PlayResult <- as.factor(hit_data$PlayResult)
+play_ids <- hit_data$PitchNo
+hit_data <- hit_data[, colSums(is.na(hit_data))/nrow(hit_data) <= 0.25]
+hit_data <- hit_data[, !colnames(hit_data) %in% 
+                       c(logistical_vars, pitching_vars)]
+
+# I used Amelia to impute any missing data
+library(Amelia)
+hit_data <- amelia(hit_data, m = 1, idvars = "PlayResult", 
+                   noms = "TaggedPitchType")
+hit_data <- hit_data$imputations[[1]]
+
+# Testing and training split
+set.seed(1014)
+hit_data$PlayResult <- factor(hit_data$PlayResult, levels = outcomes)
+index <- createDataPartition(hit_data$PlayResult, p = 0.75, list = FALSE)
+hit_train <- hit_data[index, ]
+hit_test <- hit_data[-index, ]
+```
+
+
+```{r }
+# Generated random forest model and made predictions
+library(randomForest)
+set.seed(1014)
+
+# The parameters here were tuned beforehand
+rf_model <- randomForest(PlayResult ~., 
+                         data = hit_train, 
+                         ntree = 700, 
+                         mtry = 8,
+                         importance = TRUE, 
+                         nodesize = 2)
+rf_predictions <- predict(rf_model, newdata = hit_test)
+```
+
+
+```{r }
+# Reformatting the data to build the XGB model
+library(xgboost)
+hit_train$PlayResult <- as.numeric(hit_train$PlayResult) - 1
+hit_test$PlayResult <- as.numeric(hit_test$PlayResult) - 1
+train_matrix <- model.matrix(PlayResult ~ . - 1, data = hit_train)
+test_matrix <- model.matrix(PlayResult ~ . - 1, data = hit_test)
+train_response <- hit_train$PlayResult
+test_response <- hit_test$PlayResult
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_response)
+
+# Building xgb model with pre-tuned hyperparameters
+set.seed(1014)
+dval <- xgb.DMatrix(data = test_matrix, label = test_response)
+watchlist <- list(train = dtrain, eval  = dval)
+xgb_model <- xgb.train(data = dtrain, watchlist = watchlist,  
+                          eval_metric = "mlogloss", 
+                          objective = "multi:softmax", 
+                          num_class = length(unique(train_response)),  
+                          nrounds = 1000, eta = 0.2, max_depth = 6,
+                          early_stopping_rounds = 50, verbose = 0)
+
+# Making and storing predictions
+xgb_predictions <- predict(xgb_model, newdata = test_matrix)
+predicted_labels <- factor(xgb_predictions, levels = 0:(length(outcomes) - 1),
+                           labels = outcomes)
+```
+
+
+```{r}
+library(keras)
+library(reticulate)
+library(tensorflow)
+
+# Testing and training split
+set.seed(1014)
+hit_data$PlayResult <- factor(hit_data$PlayResult, levels = outcomes)
+index <- createDataPartition(hit_data$PlayResult, p = 0.75, list = FALSE)
+hit_train <- hit_data[index, ]
+hit_test <- hit_data[-index, ]
+
+# New test and train sets for building a neural network
+hit_train$PlayResult <- factor(hit_train$PlayResult, levels = outcomes)
+hit_test$PlayResult <- factor(hit_test$PlayResult, levels = outcomes)
+nn_train <- hit_train[, -1]
+nn_test <- hit_test[, -1]
+y_train <- to_categorical(as.numeric(nn_train$PlayResult) - 1)
+y_test <- to_categorical(as.numeric(nn_test$PlayResult) - 1)
+
+
+# Normalize predictors
+x_train <- as.matrix(scale(nn_train[, -1]))
+x_test  <- as.matrix(scale(nn_test[, -1]))
+
+# Creating pipeline for neural network and training the model
+set_random_seed(1014)
+nn_model <- keras_model_sequential() %>%
+  layer_dense(units = 16, activation = 'relu', 
+              input_shape = ncol(x_train),
+              kernel_regularizer = regularizer_l2(0.0005)) %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.15) %>%
+  layer_dense(units = 32, activation = 'relu',
+              kernel_regularizer = regularizer_l2(0.0005)) %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.15) %>%
+  layer_dense(units = 4, activation = 'softmax') %>%
+  layer_dense(units = 32, activation = 'relu',
+              kernel_regularizer = regularizer_l2(0.0005)) %>%
+  layer_batch_normalization() %>%
+  layer_dense(units = 4, activation = 'softmax')  
+
+nn_model %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  metrics = c('accuracy')
+)
+
+history <- nn_model %>% fit(
+  x_train, y_train,
+  epochs = 200,
+  batch_size = 32,
+  validation_split = 0.2,
+  callbacks = list(
+    callback_early_stopping(patience = 15, restore_best_weights = TRUE)
+))
+
+# Making and storing predictions
+nn_probs <- nn_model %>% predict(x_test)
+nn_pred_classes <- apply(nn_probs, 1, which.max) - 1
+actual_classes <- apply(y_test, 1, which.max) - 1
+confusionMatrix(as.factor(nn_pred_classes), as.factor(actual_classes))
+```
+
+
+```{r}
+# Using our predictions from each of our 3 models, we can create an ensemble
+# majority voting model that considers the predictions made by all 3 models
+# for each individual batted ball and assigns an outcome based on what the
+# majority of the model classify the batted ball as
+xgb_predictions <- predicted_labels
+nn_predictions <- factor(nn_pred_classes)
+levels(nn_predictions) <- c("Double", "HomeRun", "Out", "Single")
+ensemble_preds <- data.frame(xgb = predicted_labels,
+                             nn  = nn_predictions,
+                             rf  = rf_predictions)
+
+# Apply majority vote row-wise
+library(plyr)
+voted_preds <- apply(ensemble_preds, 1, function(x) {
+  names(sort(table(x), decreasing = TRUE))[1]
+})
+
+# Evaluate
+voted_preds <- factor(voted_preds, levels = outcomes)
+hit_test$PlayResult <- as.factor(hit_test$PlayResult)
+levels(hit_test$PlayResult) <- c("Double", "HomeRun", "Out", "Single")
+confusionMatrix(voted_preds, hit_test$PlayResult)
+```
+
